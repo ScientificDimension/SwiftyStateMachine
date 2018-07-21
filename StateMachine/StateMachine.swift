@@ -1,10 +1,16 @@
+/// Source:
+/// https://github.com/narfdotpl/SwiftyStateMachine
+/// http://macoscope.com/blog/swifty-state-machine/
+/// https://www.youtube.com/watch?v=GKMrJe3mfwU
+/// https://www.youtube.com/watch?v=kBjqenUQvlU
+
 /// A type representing schema that can be reused by `StateMachine`
 /// instances.
 ///
 /// The schema incorporates three generic types: `State` and `Event`,
-/// which should be `enum`s, and `Subject`, which represents an object
+/// which should be `enum`s, and `Interacotor`, which represents an object
 /// associated with a state machine.  If you don't want to associate any
-/// object, use `Void` as `Subject` type.
+/// object, use `Void` as `Interacotor` type.
 ///
 /// The schema indicates the initial state and describes the transition
 /// logic, i.e. how states are connected via events and what code is
@@ -17,43 +23,56 @@
 /// tuple is non-`nil`, it specifies the new state that the machine
 /// should transition to and a block that should be called after the
 /// transition.  The transition block is optional and it gets passed
-/// the `Subject` object as an argument.
-public protocol StateMachineSchemaType {
-    associatedtype State
-    associatedtype Event
-    associatedtype Subject
+/// the `Interactor` object as an argument.
 
-    var initialState: State { get }
-    var transitionLogic: (State, Event) -> (State, (Subject -> ())?)? { get }
-
-    init(initialState: State, transitionLogic: (State, Event) -> (State, (Subject -> ())?)?)
+public enum StateMachineTransitionDirection {
+    case forward
+    case back
+    case idle
 }
 
+public protocol IDirectionDeterminable {
+    func determineDirection(previousState: Self) -> StateMachineTransitionDirection
+}
 
-/// A state machine schema conforming to the `StateMachineSchemaType`
+public protocol IStateMachineSchema {
+    associatedtype State: IDirectionDeterminable
+    associatedtype Event
+    associatedtype Interactor
+
+    var initialState: State { get }
+    var transitionLogic: (_ currentState: State, _ event: Event) -> ((_ transitionToNextState: Interactor) -> (State))? { get }
+
+    init(
+        initialState: State,
+        transitionLogic: @escaping (_ currentState: State, _ event: Event) -> ((_ transitionToNextState: Interactor) -> (State))? )
+}
+
+/// A state machine schema conforming to the `IStateMachineSchema`
 /// protocol.  See protocol documentation for more information.
-public struct StateMachineSchema<A, B, C>: StateMachineSchemaType {
+public struct StateMachineSchema<A: IDirectionDeterminable, B, C>: IStateMachineSchema {
     public typealias State = A
     public typealias Event = B
-    public typealias Subject = C
+    public typealias Interactor = C
 
     public let initialState: State
-    public let transitionLogic: (State, Event) -> (State, (Subject -> ())?)?
+    public let transitionLogic: (_ currentState: State, _ event: Event) -> ((_ transitionToNextState: Interactor) -> (State))?
 
-    public init(initialState: State, transitionLogic: (State, Event) -> (State, (Subject -> ())?)?) {
+    public init(
+        initialState: State,
+        transitionLogic: @escaping (_ currentState: State, _ event: Event) -> ((_ transitionToNextState: Interactor) -> (State))? ) {
         self.initialState = initialState
         self.transitionLogic = transitionLogic
     }
 }
 
-
-/// A state machine for a given schema, associated with a given subject.  See
-/// `StateMachineSchemaType` documentation for more information about schemas
-/// and subjects.
+/// A state machine for a given schema, associated with a given interactor.  See
+/// `IStateMachineSchema` documentation for more information about schemas
+/// and interactors.
 ///
-/// References to class-based subjects are weak.  This helps to remove 
-/// subject-machine reference cycles, but it also means you have to keep a
-/// strong reference to a subject somewhere else.  When subject references
+/// References to class-based interactors are weak.  This helps to remove
+/// interactor-machine reference cycles, but it also means you have to keep a
+/// strong reference to a interactor somewhere else.  When interactor references
 /// become `nil`, transitions are no longer performed.
 ///
 /// The state machine provides the `state` property for inspecting the current
@@ -62,65 +81,88 @@ public struct StateMachineSchema<A, B, C>: StateMachineSchemaType {
 ///
 /// To get notified about state changes, provide a `didTransitionCallback`
 /// block.  It is called after a transition with three arguments:
-/// the state before the transition, the event causing the transition,
-/// and the state after the transition.
-public final class StateMachine<Schema: StateMachineSchemaType> {
-    /// The current state of the machine.
-    public private(set) var state: Schema.State
+/// -the state before the transition,
+/// -the event causing the transition,
+/// -and the state after the transition.
+public final class StateMachine<Schema: IStateMachineSchema> {
+    /// states of the machine.
+    public private(set) var currentState: Schema.State
+    public private(set) var previousState: Schema.State
+    
+    /// The transition direction of the machine.
+    public private(set) var transitionDirection: StateMachineTransitionDirection
 
     /// An optional block called after a transition with three arguments:
-    /// the state before the transition, the event causing the transition,
-    /// and the state after the transition.
-    public var didTransitionCallback: ((Schema.State, Schema.Event, Schema.State) -> ())?
+    /// -the state before the transition,
+    /// -the event causing the transition,
+    /// -and the state after the transition.
+    public var didTransitionCallback: ((_ previousState: Schema.State, _ event: Schema.Event, _ currentState: Schema.State, _ transitionDirecion: StateMachineTransitionDirection) -> ())?
 
-    /// The schema of the state machine.  See `StateMachineSchemaType`
+    /// The schema of the state machine.  See `IStateMachineSchema`
     /// documentation for more information.
     private let schema: Schema
 
     /// Object associated with the state machine.  Can be accessed in
     /// transition blocks.  Closure used to allow for weak references.
-    private let subject: () -> Schema.Subject?
+    private let interactor: () -> Schema.Interactor?
 
-    private init(schema: Schema, subject: () -> Schema.Subject?) {
-        self.state = schema.initialState
+    private init(
+        schema: Schema,
+        interactor: @escaping () -> Schema.Interactor?,
+        didTransitionCallback: ((_ previousState: Schema.State, _ event: Schema.Event, _ currentState: Schema.State, _ transitionDirecion: StateMachineTransitionDirection) -> ())? = nil) {
+        self.currentState = schema.initialState
+        self.previousState = schema.initialState
+        self.transitionDirection = .forward
         self.schema = schema
-        self.subject = subject
+        self.interactor = interactor
+        self.didTransitionCallback = didTransitionCallback
     }
 
     /// A method for triggering transitions and changing the state of the
-    /// machine.  Transitions are not performed when a weak reference to the subject
+    /// machine.  Transitions are not performed when a weak reference to the interactor
     /// becomes `nil`.  If the transition logic of the schema defines a transition
     /// for current state and given event, the state is changed, the optional
     /// transition block is executed, and `didTransitionCallback` is called.
     public func handleEvent(event: Schema.Event) {
-        guard let
-            subject = subject(),
-            (newState, transition) = schema.transitionLogic(state, event)
+        guard
+            let interactor = interactor(),
+            let transitionToNextState = schema.transitionLogic(currentState, event)
         else {
             return
         }
 
-        let oldState = state
-        state = newState
+        previousState = currentState
+        currentState = transitionToNextState(interactor)
+        transitionDirection = currentState.determineDirection(previousState: previousState)
 
-        transition?(subject)
-        didTransitionCallback?(oldState, event, newState)
+        didTransitionCallback?(previousState, event, currentState, transitionDirection)
     }
 }
 
-
-public extension StateMachine where Schema.Subject: AnyObject {
-    /// Creates a state machine with a weak reference to a subject.  This helps
-    /// to remove subject-machine reference cycles, but it also means you have 
-    /// to keep a strong reference to a subject somewhere else.  When subject 
+public extension StateMachine where Schema.Interactor: AnyObject {
+    /// Creates a state machine with a weak reference to a interactor.  This helps
+    /// to remove interactor-machine reference cycles, but it also means you have
+    /// to keep a strong reference to a interactor somewhere else.  When interactor
     /// reference becomes `nil`, transitions are no longer performed.
-    public convenience init(schema: Schema, subject: Schema.Subject) {
-        self.init(schema: schema, subject: { [weak subject] in subject })
+    public convenience init(
+        schema: Schema,
+        interactor: Schema.Interactor,
+        didTransitionCallback: ((_ previousState: Schema.State, _ event: Schema.Event, _ currentState: Schema.State, _ transitionDirecion: StateMachineTransitionDirection) -> ())? = nil) {
+        self.init(
+            schema: schema,
+            interactor: { [weak interactor] in interactor },
+            didTransitionCallback: didTransitionCallback)
     }
 }
 
 public extension StateMachine {
-    public convenience init(schema: Schema, subject: Schema.Subject) {
-        self.init(schema: schema, subject: { subject })
+    public convenience init(
+        schema: Schema,
+        interactor: Schema.Interactor,
+        didTransitionCallback: ((_ previousState: Schema.State, _ event: Schema.Event, _ currentState: Schema.State, _ transitionDirecion: StateMachineTransitionDirection) -> ())? = nil) {
+        self.init(
+            schema: schema,
+            interactor: { interactor },
+            didTransitionCallback: didTransitionCallback)
     }
 }
